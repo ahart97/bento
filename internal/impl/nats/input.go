@@ -217,6 +217,11 @@ func (n *natsReader) Read(ctx context.Context) (*service.Message, service.AckFun
 		}
 	}
 
+	// Attach a sync response store so that a sync_response output in the
+	// pipeline can provide the NATS reply payload without needing a separate
+	// nats_respond output.
+	bmsg, store := bmsg.WithSyncResponseStore()
+
 	return bmsg, func(_ context.Context, res error) error {
 		var ackErr error
 		if res != nil {
@@ -224,6 +229,18 @@ func (n *natsReader) Read(ctx context.Context) (*service.Message, service.AckFun
 				ackErr = msg.NakWithDelay(n.nakDelay)
 			} else {
 				ackErr = msg.Nak()
+			}
+		} else if msg.Reply != "" {
+			// Request-reply: if sync_response populated the store, use it as
+			// the NATS reply; otherwise fall through to the normal Ack path.
+			if responses := store.Read(); len(responses) > 0 && len(responses[0]) > 0 {
+				replyMsg, err := natsReplyFromServiceMsg(responses[0][0], natsConn.HeadersSupported())
+				if err != nil {
+					return err
+				}
+				ackErr = msg.RespondMsg(replyMsg)
+			} else if n.sendAck {
+				ackErr = msg.Ack()
 			}
 		} else if n.sendAck {
 			ackErr = msg.Ack()
@@ -243,4 +260,20 @@ func (n *natsReader) Close(ctx context.Context) (err error) {
 		close(n.interruptChan)
 	})
 	return
+}
+
+func natsReplyFromServiceMsg(m *service.Message, headersSupported bool) (*nats.Msg, error) {
+	data, err := m.AsBytes()
+	if err != nil {
+		return nil, err
+	}
+	reply := nats.NewMsg("")
+	reply.Data = data
+	if headersSupported {
+		_ = m.MetaWalk(func(key, value string) error {
+			reply.Header.Add(key, value)
+			return nil
+		})
+	}
+	return reply, nil
 }
